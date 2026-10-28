@@ -1,0 +1,20 @@
+import express from 'express';
+import Database from 'better-sqlite3';
+import {mkdirSync} from 'node:fs';
+import {fileURLToPath} from 'node:url';
+import {validate,checkDuplicates} from './validation.js';
+const dataDir=fileURLToPath(new URL('../data/',import.meta.url));mkdirSync(dataDir,{recursive:true});
+const db=new Database(dataDir+'huddle.sqlite');db.pragma('journal_mode = WAL');
+db.exec('CREATE TABLE IF NOT EXISTS records (id INTEGER PRIMARY KEY, type TEXT NOT NULL, payload TEXT NOT NULL, batch TEXT NOT NULL); CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT);');
+const insert=db.prepare('INSERT INTO records(type,payload,batch) VALUES(?,?,?)');
+// Remove only generated records from earlier versions; preserve user imports.
+db.prepare("DELETE FROM records WHERE batch = 'demo'").run();
+const app=express();app.use((req,res,next)=>{const origin=req.headers.origin;if(origin&&!/^http:\/\/(localhost|127\.0\.0\.1):(5173|3001)$/.test(origin))return res.status(403).json({error:'Local origins only.'});next();});app.use(express.json({limit:'25mb'}));
+app.get('/api/records',(_req,res)=>res.json(db.prepare('SELECT * FROM records').all().map(r=>({...JSON.parse(r.payload),id:r.id,type:r.type,batch:r.batch}))));
+app.post('/api/import',(req,res)=>{try{const {type,rows,replace}=req.body;const valid=validate(type,rows);const batch=`import-${Date.now()}`;db.transaction(()=>{const existing=replace?[]:db.prepare('SELECT payload FROM records WHERE type=?').all(type).map(r=>JSON.parse(r.payload));checkDuplicates(type,valid,existing);if(replace)db.prepare('DELETE FROM records WHERE type=?').run(type);for(const r of valid)insert.run(type,JSON.stringify(r),batch);})();res.json({count:valid.length,batch});}catch(e){res.status(400).json({error:e.message});}});
+app.put('/api/records/:id',(req,res)=>{try{const record=db.prepare('SELECT * FROM records WHERE id=?').get(req.params.id);if(!record)return res.status(404).json({error:'Record not found.'});const row=validate(record.type,[req.body])[0];checkDuplicates(record.type,[row],db.prepare('SELECT payload FROM records WHERE type=? AND id != ?').all(record.type,record.id).map(r=>JSON.parse(r.payload)));db.prepare('UPDATE records SET payload=? WHERE id=?').run(JSON.stringify(row),record.id);res.json({ok:true});}catch(e){res.status(400).json({error:e.message});}});
+app.delete('/api/records/:id',(req,res)=>{db.prepare('DELETE FROM records WHERE id=?').run(req.params.id);res.json({ok:true});});
+app.delete('/api/batches/:batch',(req,res)=>{db.prepare('DELETE FROM records WHERE batch=?').run(req.params.batch);res.json({ok:true});});
+app.use(express.static(fileURLToPath(new URL('../dist/',import.meta.url))));
+app.use((err,req,res,next)=>res.status(400).json({error:'Invalid request or file too large.'}));
+app.listen(3001,'127.0.0.1',()=>console.log('Local API: http://127.0.0.1:3001'));
